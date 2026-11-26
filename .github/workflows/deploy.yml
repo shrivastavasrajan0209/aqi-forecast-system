@@ -16,22 +16,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - run: pip install -r backend/requirements.txt
-      - run: cd backend && python -m pytest -v
+
+      - name: Run backend tests
+        run: cd backend && python -m pytest -v
 
   build-and-deploy-frontend:
     needs: test-backend
     runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: cd frontend && npm ci && npm run build
-      - uses: actions/upload-pages-artifact@v3
+
+      - name: Build frontend
+        run: cd frontend && npm ci && npm run build
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
         with:
           path: frontend/dist
-      - uses: actions/deploy-pages@v4
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
