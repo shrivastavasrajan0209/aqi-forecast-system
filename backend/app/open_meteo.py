@@ -1,5 +1,5 @@
 
-"""Open-Meteo integration with batched weather requests and separate caching."""
+"""Open-Meteo integration with shared batched weather caching."""
 
 from __future__ import annotations
 
@@ -21,11 +21,13 @@ WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 CACHE_TTL = 15 * 60
 WEATHER_RETRY_COOLDOWN = 5 * 60
 
+# AQI cache: separate entry for each city and forecast horizon.
 _cache: dict[tuple[str, int], dict[str, Any]] = {}
 _cache_lock = Lock()
 
-_weather_cache: dict[int, dict[str, Any]] = {}
-_weather_retry_after: dict[int, float] = {}
+# Weather cache: one shared batch for all cities and horizons.
+_weather_cache: dict[str, Any] = {}
+_weather_retry_after: float = 0
 _weather_lock = Lock()
 
 CITIES = {
@@ -100,20 +102,27 @@ def _save_cache(key: tuple[str, int], result: dict) -> None:
         }
 
 
-def _get_weather_batch(horizon: int) -> dict[str, dict[str, Any]]:
-    """Fetch weather for all configured cities in one API request."""
+def _get_weather_batch() -> dict[str, dict[str, Any]]:
+    """
+    Fetch weather for all configured cities in one request.
+
+    The same 73-hour weather response is reused for
+    24-hour, 48-hour and 72-hour AQI forecasts.
+    """
+
+    global _weather_retry_after
 
     now = time.time()
 
     with _weather_lock:
-        cached = _weather_cache.get(horizon)
+        cached = _weather_cache.get("all_cities")
 
-        # Return fresh weather cache.
+        # Return fresh shared weather cache.
         if cached and now - cached["saved_at"] < CACHE_TTL:
             return copy.deepcopy(cached["data"])
 
-        # During cooldown, use stale weather if available.
-        if now < _weather_retry_after.get(horizon, 0):
+        # Avoid repeated requests during the cooldown period.
+        if now < _weather_retry_after:
             if cached:
                 return copy.deepcopy(cached["data"])
             return {}
@@ -135,7 +144,7 @@ def _get_weather_batch(horizon: int) -> dict[str, dict[str, Any]]:
                 "temperature_2m,relative_humidity_2m,wind_speed_10m"
             ),
             "past_hours": 24,
-            "forecast_hours": horizon + 1,
+            "forecast_hours": 73,
             "timezone": "auto",
         }
 
@@ -163,7 +172,8 @@ def _get_weather_batch(horizon: int) -> dict[str, dict[str, Any]]:
                 or len(payload) != len(CITIES)
             ):
                 raise ValueError(
-                    "Weather API returned an unexpected multi-location response."
+                    "Weather API returned an unexpected "
+                    "multi-location response."
                 )
 
             weather_by_city = {
@@ -172,28 +182,33 @@ def _get_weather_batch(horizon: int) -> dict[str, dict[str, Any]]:
                 if isinstance(weather, dict)
             }
 
-            _weather_cache[horizon] = {
+            if len(weather_by_city) != len(CITIES):
+                raise ValueError(
+                    "Weather API did not return data for all cities."
+                )
+
+            _weather_cache["all_cities"] = {
                 "data": copy.deepcopy(weather_by_city),
                 "saved_at": time.time(),
             }
 
-            _weather_retry_after.pop(horizon, None)
+            _weather_retry_after = 0
 
             print(
-                f"Weather batch updated successfully for "
+                "Weather batch updated successfully for "
                 f"{len(weather_by_city)} cities."
             )
 
             return weather_by_city
 
         except (httpx.HTTPError, ValueError) as error:
-            _weather_retry_after[horizon] = (
+            _weather_retry_after = (
                 time.time() + WEATHER_RETRY_COOLDOWN
             )
 
             print(f"Weather batch unavailable: {error}")
 
-            # Use older successful weather data if available.
+            # Use previously cached weather if available.
             if cached:
                 print("Using previously cached weather data.")
                 return copy.deepcopy(cached["data"])
@@ -273,7 +288,7 @@ def _add_weather(
 
 
 def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
-    """Fetch AQI data and enrich it with separately cached weather."""
+    """Fetch AQI data and enrich it with shared weather data."""
 
     if city_id not in CITIES:
         raise ValueError(f"Unknown city: {city_id}")
@@ -289,7 +304,7 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
     if fresh_cache is not None:
         # Retry weather enrichment independently when missing.
         if fresh_cache["current"].get("temperature") is None:
-            weather_batch = _get_weather_batch(horizon)
+            weather_batch = _get_weather_batch()
             _add_weather(fresh_cache, weather_batch.get(city_id))
             _save_cache(cache_key, fresh_cache)
 
@@ -458,8 +473,8 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         "updated_at": air_current.get("time"),
     }
 
-    # One batched weather request can enrich all five cities.
-    weather_batch = _get_weather_batch(horizon)
+    # Reuse the same shared weather batch for every horizon.
+    weather_batch = _get_weather_batch()
     _add_weather(result, weather_batch.get(city_id))
 
     _save_cache(cache_key, result)
