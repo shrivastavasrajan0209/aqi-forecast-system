@@ -1,3 +1,4 @@
+
 import React, { useState } from "react";
 import { ForecastPoint, HistoryPoint } from "../types";
 
@@ -7,141 +8,278 @@ interface Props {
   horizon: number;
 }
 
-export const ForecastChart: React.FC<Props> = ({ history, forecast, horizon }) => {
+export const ForecastChart: React.FC<Props> = ({
+  history,
+  forecast,
+  horizon,
+}) => {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
   const width = 920;
-  const height = 320;
-  const pad = { top: 20, right: 24, bottom: 38, left: 46 };
+  const height = 340;
+
+  const pad = {
+    top: 25,
+    right: 30,
+    bottom: 45,
+    left: 55,
+  };
+
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
 
-  const allValues = [
-    ...history.map((h) => h.aqi),
-    ...forecast.flatMap((f) => [f.lower_95, f.upper_95]),
+  // Remove invalid or missing AQI values.
+  const validHistory = history.filter(
+    (point) => Number.isFinite(point.aqi)
+  );
+
+  const validForecast = forecast.filter(
+    (point) => Number.isFinite(point.predicted_aqi)
+  );
+
+  const totalPoints = validHistory.length + validForecast.length;
+
+  if (totalPoints === 0) {
+    return (
+      <div className="glass-card" style={{ marginBottom: 20 }}>
+        <h2 style={{ fontSize: 18 }}>AQI Forecast</h2>
+        <p style={{ color: "var(--text-muted)" }}>
+          No valid chart data is currently available.
+        </p>
+      </div>
+    );
+  }
+
+  const values = [
+    ...validHistory.map((point) => point.aqi),
+    ...validForecast.map((point) => point.predicted_aqi),
   ];
-  const maxVal = Math.max(120, Math.ceil(Math.max(...allValues) / 25) * 25);
+
+  const rawMax = Math.max(...values);
+  const maxVal = Math.max(
+    100,
+    Math.ceil((rawMax * 1.15) / 50) * 50
+  );
+
   const minVal = 0;
 
-  const totalPoints = history.length + forecast.length;
-  const xScale = (i: number) => pad.left + (i / Math.max(1, totalPoints - 1)) * plotW;
-  const yScale = (v: number) => pad.top + plotH - ((v - minVal) / (maxVal - minVal)) * plotH;
+  const xScale = (index: number) =>
+    pad.left +
+    (index / Math.max(1, totalPoints - 1)) * plotW;
 
-  const historyPath = history
-    .map((h, i) => `${i === 0 ? "M" : "L"} ${xScale(i).toFixed(1)} ${yScale(h.aqi).toFixed(1)}`)
+  const yScale = (value: number) =>
+    pad.top +
+    plotH -
+    ((value - minVal) / (maxVal - minVal)) * plotH;
+
+  // Historical AQI line.
+  const historyPath = validHistory
+    .map(
+      (point, index) =>
+        `${index === 0 ? "M" : "L"} ${xScale(index)} ${yScale(
+          point.aqi
+        )}`
+    )
     .join(" ");
 
-  const forecastStartIdx = history.length;
-  const forecastPath = forecast
-    .map((f, idx) => {
-      const i = forecastStartIdx + idx;
-      return `${idx === 0 ? "M" : "L"} ${xScale(i).toFixed(1)} ${yScale(f.predicted_aqi).toFixed(1)}`;
-    })
+  // Forecast AQI line.
+  const forecastStartIdx = validHistory.length;
+
+  const forecastPath = validForecast
+    .map(
+      (point, index) =>
+        `${index === 0 ? "M" : "L"} ${xScale(
+          forecastStartIdx + index
+        )} ${yScale(point.predicted_aqi)}`
+    )
     .join(" ");
 
-  // Connect last history point to first forecast point
+  // Connect historical data to forecast.
   const bridgePath =
-    history.length > 0 && forecast.length > 0
-      ? `M ${xScale(history.length - 1).toFixed(1)} ${yScale(history[history.length - 1].aqi).toFixed(1)} L ${xScale(
-          forecastStartIdx
-        ).toFixed(1)} ${yScale(forecast[0].predicted_aqi).toFixed(1)}`
+    validHistory.length > 0 && validForecast.length > 0
+      ? `M ${xScale(validHistory.length - 1)} ${yScale(
+          validHistory[validHistory.length - 1].aqi
+        )} L ${xScale(forecastStartIdx)} ${yScale(
+          validForecast[0].predicted_aqi
+        )}`
       : "";
 
-  const buildBandPath = (upperKey: "upper_95" | "upper_80", lowerKey: "lower_95" | "lower_80") => {
-    if (forecast.length === 0) return "";
-    const top = forecast
-      .map((f, idx) => `${idx === 0 ? "M" : "L"} ${xScale(forecastStartIdx + idx).toFixed(1)} ${yScale(f[upperKey]).toFixed(1)}`)
-      .join(" ");
-    const bottom = [...forecast]
-      .reverse()
-      .map((f, rIdx) => {
-        const idx = forecast.length - 1 - rIdx;
-        return `L ${xScale(forecastStartIdx + idx).toFixed(1)} ${yScale(f[lowerKey]).toFixed(1)}`;
-      })
-      .join(" ");
-    return `${top} ${bottom} Z`;
-  };
+  const tickStep = maxVal <= 200 ? 25 : 50;
 
-  const yTicks = [0, 50, 100, 150, 200, 300].filter((t) => t <= maxVal);
-  const activePoint = hoverIdx !== null && hoverIdx >= forecastStartIdx ? forecast[hoverIdx - forecastStartIdx] : null;
+  const yTicks = Array.from(
+    { length: Math.floor(maxVal / tickStep) + 1 },
+    (_, index) => index * tickStep
+  );
+
+  const activePoint =
+    hoverIdx !== null && hoverIdx >= forecastStartIdx
+      ? validForecast[hoverIdx - forecastStartIdx]
+      : null;
 
   return (
     <div className="glass-card" style={{ marginBottom: 20 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 14 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: 12,
+          marginBottom: 18,
+        }}
+      >
         <div>
           <h2 style={{ fontSize: 18, fontWeight: 600 }}>
-            24h History &amp; {horizon}h Probabilistic AQI Forecast
+            24h History &amp; {horizon}h AQI Forecast
           </h2>
-          <p style={{ fontSize: 13, color: "var(--text-muted)" }}>
-            Shaded ribbons show 80% and 95% prediction intervals—uncertainty widens with horizon.
+
+          <p
+            style={{
+              fontSize: 13,
+              color: "var(--text-muted)",
+              marginTop: 5,
+            }}
+          >
+            Historical and forecast values from Open-Meteo atmospheric
+            model estimates.
           </p>
         </div>
-        <div style={{ display: "flex", gap: 16, fontSize: 12, color: "var(--text-muted)" }}>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 12, height: 3, background: "#94a3b8", display: "inline-block" }} /> Observed
+
+        <div
+          style={{
+            display: "flex",
+            gap: 16,
+            fontSize: 12,
+            color: "var(--text-muted)",
+            flexWrap: "wrap",
+          }}
+        >
+          <span>
+            <span style={{ color: "#94a3b8" }}>━</span> Historical estimates
           </span>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 12, height: 3, background: "#38bdf8", display: "inline-block" }} /> Forecast
-          </span>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 12, height: 10, background: "rgba(56,189,248,0.28)", borderRadius: 2, display: "inline-block" }} /> 80% CI
-          </span>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <span style={{ width: 12, height: 10, background: "rgba(56,189,248,0.12)", borderRadius: 2, display: "inline-block" }} /> 95% CI
+
+          <span>
+            <span style={{ color: "#38bdf8" }}>━</span> Forecast
           </span>
         </div>
       </div>
 
-      <div style={{ position: "relative", width: "100%", overflowX: "auto" }}>
-        <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", minWidth: 620, height: "auto", display: "block" }}>
-          {yTicks.map((t) => (
-            <g key={t}>
-              <line x1={pad.left} x2={width - pad.right} y1={yScale(t)} y2={yScale(t)} stroke="rgba(148,163,184,0.12)" strokeDasharray="4 4" />
-              <text x={pad.left - 8} y={yScale(t) + 4} textAnchor="end" fill="#94a3b8" fontSize="11" className="mono">
-                {t}
+      <div style={{ width: "100%", overflowX: "auto" }}>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          style={{
+            width: "100%",
+            minWidth: 620,
+            height: "auto",
+            display: "block",
+          }}
+        >
+          {/* Horizontal grid and Y-axis labels */}
+          {yTicks.map((tick) => (
+            <g key={tick}>
+              <line
+                x1={pad.left}
+                x2={width - pad.right}
+                y1={yScale(tick)}
+                y2={yScale(tick)}
+                stroke="rgba(148,163,184,0.15)"
+                strokeDasharray="4 4"
+              />
+
+              <text
+                x={pad.left - 10}
+                y={yScale(tick) + 4}
+                textAnchor="end"
+                fill="#94a3b8"
+                fontSize="11"
+              >
+                {tick}
               </text>
             </g>
           ))}
 
-          {/* Now divider */}
-          <line
-            x1={xScale(forecastStartIdx - 0.5)}
-            x2={xScale(forecastStartIdx - 0.5)}
-            y1={pad.top}
-            y2={height - pad.bottom}
-            stroke="rgba(248, 250, 252, 0.28)"
-            strokeDasharray="3 3"
-          />
-          <text x={xScale(forecastStartIdx - 0.5)} y={pad.top + 12} textAnchor="middle" fill="#cbd5e1" fontSize="10" className="mono">
-            NOW
-          </text>
-
-          {/* Uncertainty bands */}
-          <path d={buildBandPath("upper_95", "lower_95")} fill="rgba(56, 189, 248, 0.12)" />
-          <path d={buildBandPath("upper_80", "lower_80")} fill="rgba(56, 189, 248, 0.25)" />
-
-          {/* Lines */}
-          <path d={historyPath} fill="none" stroke="#94a3b8" strokeWidth="2.2" />
-          <path d={bridgePath} fill="none" stroke="#38bdf8" strokeWidth="2.2" strokeDasharray="4 3" />
-          <path d={forecastPath} fill="none" stroke="#38bdf8" strokeWidth="2.5" />
-
-          {/* Hover targets */}
-          {forecast.map((f, idx) => {
-            const i = forecastStartIdx + idx;
-            return (
-              <rect
-                key={f.horizon_hour}
-                x={xScale(i) - plotW / totalPoints / 2}
-                y={pad.top}
-                width={plotW / totalPoints}
-                height={plotH}
-                fill="transparent"
-                onMouseEnter={() => setHoverIdx(i)}
-                onMouseLeave={() => setHoverIdx(null)}
+          {/* Current time divider */}
+          {validHistory.length > 0 && validForecast.length > 0 && (
+            <>
+              <line
+                x1={xScale(forecastStartIdx - 0.5)}
+                x2={xScale(forecastStartIdx - 0.5)}
+                y1={pad.top}
+                y2={height - pad.bottom}
+                stroke="rgba(248,250,252,0.4)"
+                strokeDasharray="4 4"
               />
+
+              <text
+                x={xScale(forecastStartIdx - 0.5)}
+                y={pad.top + 12}
+                textAnchor="middle"
+                fill="#cbd5e1"
+                fontSize="10"
+              >
+                NOW
+              </text>
+            </>
+          )}
+
+          {/* Historical line */}
+          <path
+            d={historyPath}
+            fill="none"
+            stroke="#94a3b8"
+            strokeWidth="2.5"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+
+          {/* Connect history and forecast */}
+          <path
+            d={bridgePath}
+            fill="none"
+            stroke="#38bdf8"
+            strokeWidth="2"
+            strokeDasharray="5 5"
+          />
+
+          {/* Forecast line */}
+          <path
+            d={forecastPath}
+            fill="none"
+            stroke="#38bdf8"
+            strokeWidth="2.8"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+
+          {/* Forecast points */}
+          {validForecast.map((point, index) => {
+            const chartIndex = forecastStartIdx + index;
+
+            return (
+              <g key={`${point.horizon_hour}-${index}`}>
+                <circle
+                  cx={xScale(chartIndex)}
+                  cy={yScale(point.predicted_aqi)}
+                  r={hoverIdx === chartIndex ? 6 : 3}
+                  fill="#38bdf8"
+                  stroke="#0f172a"
+                  strokeWidth="2"
+                />
+
+                <rect
+                  x={xScale(chartIndex) - plotW / totalPoints / 2}
+                  y={pad.top}
+                  width={Math.max(1, plotW / totalPoints)}
+                  height={plotH}
+                  fill="transparent"
+                  onMouseEnter={() => setHoverIdx(chartIndex)}
+                  onMouseLeave={() => setHoverIdx(null)}
+                />
+              </g>
             );
           })}
 
+          {/* Hover indicator */}
           {activePoint && hoverIdx !== null && (
             <g>
               <line
@@ -149,30 +287,63 @@ export const ForecastChart: React.FC<Props> = ({ history, forecast, horizon }) =
                 x2={xScale(hoverIdx)}
                 y1={pad.top}
                 y2={height - pad.bottom}
-                stroke="rgba(56,189,248,0.6)"
-                strokeWidth="1"
+                stroke="#38bdf8"
+                strokeDasharray="4 4"
               />
-              <circle cx={xScale(hoverIdx)} cy={yScale(activePoint.predicted_aqi)} r="4.5" fill="#38bdf8" stroke="#0f172a" strokeWidth="2" />
+
+              <circle
+                cx={xScale(hoverIdx)}
+                cy={yScale(activePoint.predicted_aqi)}
+                r="6"
+                fill="#38bdf8"
+                stroke="#ffffff"
+                strokeWidth="2"
+              />
             </g>
           )}
 
           {/* X-axis labels */}
-          <text x={xScale(0)} y={height - 10} textAnchor="start" fill="#94a3b8" fontSize="11" className="mono">
+          <text
+            x={xScale(0)}
+            y={height - 12}
+            textAnchor="start"
+            fill="#94a3b8"
+            fontSize="11"
+          >
             -24h
           </text>
-          <text x={xScale(forecastStartIdx)} y={height - 10} textAnchor="middle" fill="#94a3b8" fontSize="11" className="mono">
-            +1h
-          </text>
-          <text x={xScale(totalPoints - 1)} y={height - 10} textAnchor="end" fill="#94a3b8" fontSize="11" className="mono">
-            +{horizon}h
-          </text>
+
+          {validForecast.length > 0 && (
+            <>
+              <text
+                x={xScale(forecastStartIdx)}
+                y={height - 12}
+                textAnchor="middle"
+                fill="#94a3b8"
+                fontSize="11"
+              >
+                +1h
+              </text>
+
+              <text
+                x={xScale(totalPoints - 1)}
+                y={height - 12}
+                textAnchor="end"
+                fill="#94a3b8"
+                fontSize="11"
+              >
+                +{horizon}h
+              </text>
+            </>
+          )}
         </svg>
 
+        {/* Hover details */}
         {activePoint && (
           <div
             style={{
-              marginTop: 8,
-              padding: "10px 14px",
+              marginTop: 12,
+              padding: "12px 16px",
               borderRadius: 10,
               background: "var(--surface-elevated)",
               border: "1px solid var(--border)",
@@ -182,23 +353,26 @@ export const ForecastChart: React.FC<Props> = ({ history, forecast, horizon }) =
               fontSize: 13,
             }}
           >
-            <span className="mono" style={{ color: "var(--accent)", fontWeight: 600 }}>
-              +{activePoint.horizon_hour}h ({new Date(activePoint.timestamp).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" })})
+            <span
+              style={{
+                color: "var(--accent)",
+                fontWeight: 600,
+              }}
+            >
+              +{activePoint.horizon_hour}h (
+              {new Date(activePoint.timestamp).toLocaleString([], {
+                weekday: "short",
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+              )
             </span>
+
             <span>
-              Expected AQI: <strong className="mono">{activePoint.predicted_aqi}</strong>
-            </span>
-            <span style={{ color: "var(--text-muted)" }}>
-              80% CI: <strong className="mono">{activePoint.lower_80}–{activePoint.upper_80}</strong>
-            </span>
-            <span style={{ color: "var(--text-muted)" }}>
-              95% CI: <strong className="mono">{activePoint.lower_95}–{activePoint.upper_95}</strong>
-            </span>
-            <span style={{ color: "var(--text-muted)" }}>
-              Wind: <strong className="mono">{activePoint.wind_speed} km/h</strong>
-            </span>
-            <span style={{ color: "var(--text-muted)" }}>
-              Traffic: <strong className="mono">{Math.round(activePoint.traffic_index * 100)}%</strong>
+              Forecast AQI:{" "}
+              <strong>
+                {Math.round(activePoint.predicted_aqi)}
+              </strong>
             </span>
           </div>
         )}

@@ -1,102 +1,124 @@
-"""FastAPI application for the AQI Forecast & Health Guidance System."""
+
+"""FastAPI application for the AeroPulse AQI forecasting dashboard."""
 
 from __future__ import annotations
 
-from functools import lru_cache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from .data_generator import CITIES, generate_city_history
+from .open_meteo import CITIES, fetch_city_data
 from .health_advisor import generate_health_guidance, get_aqi_category
-from .models import forecast_next_hours, train_and_compare_models
 
 app = FastAPI(
-    title="AQI Forecast & Health Guidance API",
-    description="24-72h city AQI forecasting with uncertainty intervals, model comparison, and rule-based health guidance.",
-    version="1.0.0",
+    title="AeroPulse AQI Forecast API",
+    description=(
+        "24-72 hour AQI forecasts and rule-based health guidance "
+        "using Open-Meteo atmospheric model estimates."
+    ),
+    version="2.0.0",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@lru_cache(maxsize=8)
-def _get_trained_city(city_id: str) -> dict:
-    raw_df = generate_city_history(city_id, hours=24 * 60)
-    return train_and_compare_models(raw_df)
-
-
 @app.get("/api/health")
 def health_check() -> dict:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "data_source": "Open-Meteo",
+        "forecast_type": "Atmospheric model estimates",
+    }
 
 
 @app.get("/api/cities")
 def list_cities() -> list[dict]:
     return [
         {
-            "id": c.id,
-            "name": c.name,
-            "country": c.country,
-            "base_aqi": c.base_aqi,
+            "id": city["id"],
+            "name": city["name"],
+            "country": city["country"],
+            "base_aqi": None,
         }
-        for c in CITIES.values()
+        for city in CITIES.values()
     ]
 
 
 @app.get("/api/forecast")
 def get_forecast(
     city_id: str = Query("delhi", description="City identifier"),
-    horizon: int = Query(72, ge=24, le=72, description="Forecast horizon in hours (24-72)"),
+    horizon: int = Query(
+        72,
+        ge=24,
+        le=72,
+        description="Forecast horizon in hours (24-72)",
+    ),
 ) -> dict:
     if city_id not in CITIES:
-        raise HTTPException(status_code=404, detail=f"City '{city_id}' not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"City '{city_id}' not found",
+        )
 
-    trained = _get_trained_city(city_id)
-    raw_df = trained["last_df"]
-    recent_history = [
-        {
-            "timestamp": row["timestamp"].isoformat(),
-            "aqi": float(row["aqi"]),
-            "pm25": float(row["pm25"]),
-            "temperature": float(row["temperature"]),
-            "humidity": float(row["humidity"]),
-            "wind_speed": float(row["wind_speed"]),
-            "traffic_index": float(row["traffic_index"]),
-        }
-        for _, row in raw_df.iloc[-24:].iterrows()
-    ]
+    try:
+        data = fetch_city_data(city_id, horizon)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to retrieve AQI data from Open-Meteo: {exc}",
+        ) from exc
 
-    forecast_points = forecast_next_hours(trained, horizon_hours=horizon)
-    peak_aqi = max(p["predicted_aqi"] for p in forecast_points)
-    upper_95_peak = max(p["upper_95"] for p in forecast_points)
-    avg_aqi = sum(p["predicted_aqi"] for p in forecast_points) / len(forecast_points)
-    current_aqi = float(raw_df.iloc[-1]["aqi"])
+    current = data["current"]
+    forecast = data["forecast"]
+    history = data["recent_history"]
+
+    peak_aqi = max(point["predicted_aqi"] for point in forecast)
+    average_aqi = sum(
+        point["predicted_aqi"] for point in forecast
+    ) / len(forecast)
+
+    # The API does not provide statistical confidence intervals.
+    # Therefore, health guidance uses the forecast peak directly.
+    guidance = generate_health_guidance(
+        peak_aqi=peak_aqi,
+        upper_95_peak=peak_aqi,
+        avg_aqi=average_aqi,
+    )
+
+    # Replace the old confidence-interval message with an honest source note.
+    guidance["uncertainty_note"] = (
+        "These forecasts are atmospheric model estimates from Open-Meteo, "
+        "not direct ground-station measurements. Actual local air quality "
+        "may differ. No statistical confidence interval is provided."
+    )
+
+    for point in forecast:
+        point["category"] = get_aqi_category(point["predicted_aqi"])
+
+    for point in history:
+        point["category"] = get_aqi_category(point["aqi"])
 
     return {
-        "city": {
-            "id": CITIES[city_id].id,
-            "name": CITIES[city_id].name,
-            "country": CITIES[city_id].country,
-        },
+        "city": data["city"],
         "current": {
-            "aqi": current_aqi,
-            "category": get_aqi_category(current_aqi),
-            "temperature": float(raw_df.iloc[-1]["temperature"]),
-            "humidity": float(raw_df.iloc[-1]["humidity"]),
-            "wind_speed": float(raw_df.iloc[-1]["wind_speed"]),
-            "traffic_index": float(raw_df.iloc[-1]["traffic_index"]),
+            **current,
+            "category": get_aqi_category(current["aqi"]),
         },
         "horizon_hours": horizon,
-        "best_model_id": trained["best_model_id"],
-        "model_comparisons": trained["comparisons"],
-        "feature_drivers": trained["feature_drivers"][:10],
-        "recent_history": recent_history,
-        "forecast": forecast_points,
-        "health_guidance": generate_health_guidance(peak_aqi, upper_95_peak, avg_aqi),
+        "best_model_id": "open_meteo",
+        "model_comparisons": [],
+        "feature_drivers": [],
+        "recent_history": history,
+        "forecast": forecast,
+        "health_guidance": guidance,
+        "source": data["source"],
+        "source_type": data["source_type"],
+        "timezone": data["timezone"],
+        "updated_at": data["updated_at"],
+        "is_demo_fallback": False,
     }
