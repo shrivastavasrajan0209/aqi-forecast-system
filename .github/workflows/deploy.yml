@@ -13,6 +13,10 @@ permissions:
   pages: write
   id-token: write
 
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
 jobs:
   test-backend:
     name: Test Backend
@@ -35,14 +39,10 @@ jobs:
           cd backend
           python -m pytest -v
 
-  build-and-deploy-frontend:
-    name: Build and Deploy Frontend
+  build-frontend:
+    name: Build and Upload Frontend
     needs: test-backend
     runs-on: ubuntu-latest
-
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
@@ -69,9 +69,19 @@ jobs:
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
+          name: github-pages
           path: frontend/dist
 
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: build-frontend
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
