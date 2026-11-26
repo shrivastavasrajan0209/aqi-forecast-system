@@ -23,11 +23,36 @@ export default function App() {
   const [data, setData] = useState<ForecastResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [cityError, setCityError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState<number>(0);
 
+  // Fetch available cities
   useEffect(() => {
-    fetchCities().then(setCities).catch(console.error);
-  }, []);
+    let cancelled = false;
 
+    fetchCities()
+      .then((result) => {
+        if (!cancelled) {
+          setCities(result);
+          setCityError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setCityError(
+            err instanceof Error
+              ? err.message
+              : "Unable to load available cities."
+          );
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
+
+  // Fetch AQI forecast
   useEffect(() => {
     let cancelled = false;
 
@@ -36,7 +61,9 @@ export default function App() {
 
     fetchForecast(selectedCity, horizon)
       .then((result) => {
-        if (!cancelled) setData(result);
+        if (!cancelled) {
+          setData(result);
+        }
       })
       .catch((err) => {
         if (!cancelled) {
@@ -48,17 +75,23 @@ export default function App() {
         }
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [selectedCity, horizon]);
+  }, [selectedCity, horizon, reloadKey]);
 
   const hasTraffic =
     data?.current.traffic_index != null &&
     Number.isFinite(data.current.traffic_index);
+
+  const retry = () => {
+    setReloadKey((current) => current + 1);
+  };
 
   return (
     <div className="app-shell">
@@ -199,20 +232,53 @@ export default function App() {
         </div>
       </header>
 
-      {data?.is_demo_fallback && (
+      {cityError && (
         <div
           style={{
             marginBottom: 16,
-            padding: "10px 14px",
+            padding: 14,
             borderRadius: 12,
-            background: "rgba(245,158,11,0.1)",
-            border: "1px solid rgba(245,158,11,0.25)",
+            background: "rgba(248,113,113,0.08)",
+            border: "1px solid rgba(248,113,113,0.25)",
+            color: "#fca5a5",
             fontSize: 13,
-            color: "#fcd34d",
           }}
         >
-          Demo preview: the backend could not provide current API data.
-          Displayed values are simulated and are not live measurements.
+          Unable to load the city list. {cityError}
+        </div>
+      )}
+
+      {error && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 16,
+            borderRadius: 12,
+            background: "rgba(248,113,113,0.08)",
+            border: "1px solid rgba(248,113,113,0.25)",
+            color: "#fca5a5",
+            fontSize: 13,
+          }}
+        >
+          <p style={{ fontWeight: 700, marginBottom: 6 }}>
+            Unable to load forecast
+          </p>
+
+          <p>{error}</p>
+
+          {data && (
+            <p style={{ marginTop: 8 }}>
+              The previously loaded forecast is still displayed and may be
+              outdated.
+            </p>
+          )}
+
+          <button
+            onClick={retry}
+            style={{ marginTop: 12 }}
+          >
+            Try again
+          </button>
         </div>
       )}
 
@@ -242,15 +308,13 @@ export default function App() {
           }}
         >
           <p style={{ color: "#f87171", marginBottom: 10 }}>
-            Unable to load forecast
+            No forecast data available
           </p>
+
           <p>{error}</p>
 
           <button
-            onClick={() => {
-              setSelectedCity((current) => current);
-              setHorizon((current) => current);
-            }}
+            onClick={retry}
             style={{ marginTop: 16 }}
           >
             Try again
@@ -341,7 +405,10 @@ export default function App() {
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <Thermometer size={18} color="#f59e0b" />
 
-                  <span className="mono" style={{ fontSize: 22, fontWeight: 600 }}>
+                  <span
+                    className="mono"
+                    style={{ fontSize: 22, fontWeight: 600 }}
+                  >
                     {data.current.temperature}°C
                   </span>
                 </div>
@@ -361,7 +428,10 @@ export default function App() {
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <Wind size={18} color="#38bdf8" />
 
-                  <span className="mono" style={{ fontSize: 22, fontWeight: 600 }}>
+                  <span
+                    className="mono"
+                    style={{ fontSize: 22, fontWeight: 600 }}
+                  >
                     {data.current.wind_speed} km/h
                   </span>
                 </div>
@@ -381,7 +451,10 @@ export default function App() {
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <Droplets size={18} color="#10b981" />
 
-                  <span className="mono" style={{ fontSize: 22, fontWeight: 600 }}>
+                  <span
+                    className="mono"
+                    style={{ fontSize: 22, fontWeight: 600 }}
+                  >
                     {data.current.humidity}%
                   </span>
                 </div>
@@ -402,7 +475,10 @@ export default function App() {
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <Car size={18} color="#f97316" />
 
-                    <span className="mono" style={{ fontSize: 22, fontWeight: 600 }}>
+                    <span
+                      className="mono"
+                      style={{ fontSize: 22, fontWeight: 600 }}
+                    >
                       {Math.round(data.current.traffic_index! * 100)}%
                     </span>
                   </div>
