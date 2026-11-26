@@ -1,21 +1,27 @@
 
-"""Open-Meteo integration for real-time model-based AQI data."""
+"""Open-Meteo integration with optional weather data and caching."""
 
 from __future__ import annotations
 
+import copy
 import ssl
+import time
 from datetime import datetime
+from threading import Lock
 from typing import Any
 
 import httpx
 import truststore
 
-# Use Windows' trusted certificate store.
 truststore.inject_into_ssl()
-
 
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+CACHE_TTL = 15 * 60
+
+_cache: dict[tuple[str, int], dict[str, Any]] = {}
+_cache_lock = Lock()
 
 CITIES = {
     "delhi": {
@@ -57,20 +63,51 @@ CITIES = {
 
 
 def _number(value: Any) -> float | None:
-    """Convert an API value to a float, preserving missing values."""
     if value is None:
         return None
     return round(float(value), 2)
 
 
+def _get_cached(
+    key: tuple[str, int],
+) -> tuple[dict | None, dict | None]:
+    """Return fresh and stale cached results."""
+    with _cache_lock:
+        entry = _cache.get(key)
+
+        if not entry:
+            return None, None
+
+        result = copy.deepcopy(entry["data"])
+
+        if time.time() - entry["saved_at"] < CACHE_TTL:
+            return result, result
+
+        return None, result
+
+
+def _save_cache(key: tuple[str, int], result: dict) -> None:
+    with _cache_lock:
+        _cache[key] = {
+            "data": copy.deepcopy(result),
+            "saved_at": time.time(),
+        }
+
+
 def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
-    """Fetch current conditions, recent hourly history and AQI forecast."""
+    """Fetch AQI data, with optional weather enrichment and caching."""
 
     if city_id not in CITIES:
         raise ValueError(f"Unknown city: {city_id}")
 
     if horizon < 24 or horizon > 72:
         raise ValueError("Forecast horizon must be between 24 and 72 hours.")
+
+    cache_key = (city_id, horizon)
+    fresh_cache, stale_cache = _get_cached(cache_key)
+
+    if fresh_cache is not None:
+        return fresh_cache
 
     city = CITIES[city_id]
 
@@ -104,31 +141,55 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         "timezone": "auto",
     }
 
-    # Explicitly use Windows' certificate store.
     ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 
-    with httpx.Client(
-        timeout=30.0,
-        verify=ssl_context,
-        follow_redirects=True,
-    ) as client:
+    try:
+        with httpx.Client(
+            timeout=30.0,
+            verify=ssl_context,
+            follow_redirects=True,
+        ) as client:
 
-        air_response = client.get(
-            AIR_QUALITY_URL,
-            params=air_params,
-        )
-        air_response.raise_for_status()
-        air = air_response.json()
+            # AQI is the primary required data source.
+            air_response = client.get(
+                AIR_QUALITY_URL,
+                params=air_params,
+            )
+            air_response.raise_for_status()
+            air = air_response.json()
 
-        weather_response = client.get(
-            WEATHER_URL,
-            params=weather_params,
-        )
-        weather_response.raise_for_status()
-        weather = weather_response.json()
+            # Weather is supplementary. A weather API failure
+            # must not prevent an AQI forecast from being returned.
+            weather = {}
+
+            try:
+                weather_response = client.get(
+                    WEATHER_URL,
+                    params=weather_params,
+                )
+                weather_response.raise_for_status()
+                weather = weather_response.json()
+
+            except httpx.HTTPError as error:
+                print(
+                    f"Weather API unavailable for {city_id}: {error}"
+                )
+
+    except httpx.HTTPError as error:
+        if stale_cache is not None:
+            print(
+                f"AQI API unavailable for {city_id}; "
+                "using previously cached forecast."
+            )
+            return stale_cache
+
+        raise RuntimeError(
+            f"Unable to retrieve AQI data from Open-Meteo: {error}"
+        ) from error
 
     air_current = air.get("current") or {}
     weather_current = weather.get("current") or {}
+
     air_hourly = air.get("hourly") or {}
     weather_hourly = weather.get("hourly") or {}
 
@@ -174,14 +235,12 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         air_current["time"]
     )
 
-    common_times = sorted(
-        set(air_times).intersection(weather_times)
-    )
-
+    # Use AQI timestamps as the source of truth.
+    # Weather timestamps are not required.
     history = []
     future = []
 
-    for timestamp in common_times:
+    for timestamp in sorted(air_times):
         time_value = datetime.fromisoformat(timestamp)
 
         aqi = hourly_value(
@@ -278,7 +337,7 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         "traffic_index": None,
     }
 
-    return {
+    result = {
         "city": {
             "id": city["id"],
             "name": city["name"],
@@ -295,3 +354,7 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         "timezone": air.get("timezone"),
         "updated_at": air_current.get("time"),
     }
+
+    _save_cache(cache_key, result)
+
+    return result
