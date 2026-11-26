@@ -1,9 +1,10 @@
 
-"""Open-Meteo integration with shared batched weather caching."""
+"""AQI integration using Open-Meteo and weather using WeatherAPI.com."""
 
 from __future__ import annotations
 
 import copy
+import os
 import ssl
 import time
 from datetime import datetime
@@ -16,17 +17,18 @@ import truststore
 truststore.inject_into_ssl()
 
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_URL = "https://api.weatherapi.com/v1/forecast.json"
 
 CACHE_TTL = 15 * 60
 WEATHER_RETRY_COOLDOWN = 5 * 60
 
-# AQI cache: separate entry for each city and forecast horizon.
 _cache: dict[tuple[str, int], dict[str, Any]] = {}
 _cache_lock = Lock()
 
-# Weather cache: one shared batch for all cities and horizons.
-_weather_cache: dict[str, Any] = {}
+_weather_cache: dict[str, Any] = {
+    "data": {},
+    "saved_at": 0,
+}
 _weather_retry_after: float = 0
 _weather_lock = Lock()
 
@@ -104,51 +106,47 @@ def _save_cache(key: tuple[str, int], result: dict) -> None:
 
 def _get_weather_batch() -> dict[str, dict[str, Any]]:
     """
-    Fetch weather for all configured cities in one request.
+    Fetch weather for all five cities using WeatherAPI.com.
 
-    The same 73-hour weather response is reused for
-    24-hour, 48-hour and 72-hour AQI forecasts.
+    One shared cache is used for all forecast horizons.
     """
 
     global _weather_retry_after
 
+    api_key = os.getenv("WEATHERAPI_KEY")
+
+    if not api_key:
+        print("Weather unavailable: WEATHERAPI_KEY is not configured.")
+        return {}
+
     now = time.time()
 
     with _weather_lock:
-        cached = _weather_cache.get("all_cities")
+        cached = copy.deepcopy(_weather_cache["data"])
 
-        # Return fresh shared weather cache.
-        if cached and now - cached["saved_at"] < CACHE_TTL:
-            return copy.deepcopy(cached["data"])
+        if (
+            cached
+            and now - _weather_cache["saved_at"] < CACHE_TTL
+        ):
+            return cached
 
-        # Avoid repeated requests during the cooldown period.
         if now < _weather_retry_after:
             if cached:
-                return copy.deepcopy(cached["data"])
-            return {}
+                print("Weather cooldown active. Using cached data.")
+            return cached
 
-        latitudes = ",".join(
-            str(city["latitude"]) for city in CITIES.values()
-        )
-        longitudes = ",".join(
-            str(city["longitude"]) for city in CITIES.values()
-        )
+        weather_by_city = {}
 
-        params = {
-            "latitude": latitudes,
-            "longitude": longitudes,
-            "current": (
-                "temperature_2m,relative_humidity_2m,wind_speed_10m"
-            ),
-            "hourly": (
-                "temperature_2m,relative_humidity_2m,wind_speed_10m"
-            ),
-            "past_hours": 24,
-            "forecast_hours": 73,
-            "timezone": "auto",
+        params_base = {
+            "key": api_key,
+            "days": 3,
+            "aqi": "no",
+            "alerts": "no",
         }
 
-        ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_context = truststore.SSLContext(
+            ssl.PROTOCOL_TLS_CLIENT
+        )
 
         try:
             with httpx.Client(
@@ -156,86 +154,140 @@ def _get_weather_batch() -> dict[str, dict[str, Any]]:
                 verify=ssl_context,
                 follow_redirects=True,
             ) as client:
-                response = client.get(
-                    WEATHER_URL,
-                    params=params,
+
+                for city_id, city in CITIES.items():
+                    params = {
+                        **params_base,
+                        "q": (
+                            f'{city["latitude"]},'
+                            f'{city["longitude"]}'
+                        ),
+                    }
+
+                    try:
+                        response = client.get(
+                            WEATHER_URL,
+                            params=params,
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
+
+                        current = payload.get("current") or {}
+                        forecast = payload.get("forecast") or {}
+
+                        forecast_days = (
+                            forecast.get("forecastday") or []
+                        )
+
+                        if not current or not forecast_days:
+                            raise ValueError(
+                                "WeatherAPI returned incomplete data."
+                            )
+
+                        hourly = {}
+
+                        for day in forecast_days:
+                            for hour in day.get("hour", []):
+                                timestamp = hour.get("time")
+
+                                if timestamp:
+                                    # Normalize to the AQI timestamp format.
+                                    normalized = (
+                                        timestamp.replace(" ", "T")[:16]
+                                    )
+                                    hourly[normalized] = {
+                                        "temperature_2m": hour.get(
+                                            "temp_c"
+                                        ),
+                                        "relative_humidity_2m": hour.get(
+                                            "humidity"
+                                        ),
+                                        "wind_speed_10m": hour.get(
+                                            "wind_kph"
+                                        ),
+                                    }
+
+                        weather_by_city[city_id] = {
+                            "current": {
+                                "temperature_2m": current.get("temp_c"),
+                                "relative_humidity_2m": current.get(
+                                    "humidity"
+                                ),
+                                "wind_speed_10m": current.get("wind_kph"),
+                            },
+                            "hourly": hourly,
+                        }
+
+                        print(
+                            f"Weather updated successfully: {city_id}"
+                        )
+
+                    except (
+                        httpx.HTTPError,
+                        ValueError,
+                        KeyError,
+                    ) as error:
+                        print(
+                            f"Weather unavailable for {city_id}: {error}"
+                        )
+
+            if weather_by_city:
+                # Preserve previously successful city data if one
+                # city temporarily fails.
+                combined = {
+                    **cached,
+                    **weather_by_city,
+                }
+
+                _weather_cache["data"] = copy.deepcopy(combined)
+                _weather_cache["saved_at"] = time.time()
+
+                _weather_retry_after = 0
+
+                print(
+                    "Weather cache updated for "
+                    f"{len(weather_by_city)} cities."
                 )
-                response.raise_for_status()
-                payload = response.json()
 
-            # Multiple locations are returned as a list.
-            if isinstance(payload, dict):
-                payload = [payload]
+                return combined
 
-            if (
-                not isinstance(payload, list)
-                or len(payload) != len(CITIES)
-            ):
-                raise ValueError(
-                    "Weather API returned an unexpected "
-                    "multi-location response."
-                )
-
-            weather_by_city = {
-                city_id: weather
-                for city_id, weather in zip(CITIES.keys(), payload)
-                if isinstance(weather, dict)
-            }
-
-            if len(weather_by_city) != len(CITIES):
-                raise ValueError(
-                    "Weather API did not return data for all cities."
-                )
-
-            _weather_cache["all_cities"] = {
-                "data": copy.deepcopy(weather_by_city),
-                "saved_at": time.time(),
-            }
-
-            _weather_retry_after = 0
-
-            print(
-                "Weather batch updated successfully for "
-                f"{len(weather_by_city)} cities."
+            _weather_retry_after = (
+                time.time() + WEATHER_RETRY_COOLDOWN
             )
 
-            return weather_by_city
+            print("Weather provider returned no usable city data.")
+
+            return cached
 
         except (httpx.HTTPError, ValueError) as error:
             _weather_retry_after = (
                 time.time() + WEATHER_RETRY_COOLDOWN
             )
 
-            print(f"Weather batch unavailable: {error}")
+            print(f"Weather service unavailable: {error}")
 
-            # Use previously cached weather if available.
-            if cached:
-                print("Using previously cached weather data.")
-                return copy.deepcopy(cached["data"])
-
-            return {}
+            return cached
 
 
 def _weather_value(
     hourly: dict,
-    index: dict[str, int],
     key: str,
     timestamp: str,
 ) -> float | None:
-    position = index.get(timestamp)
-    values = hourly.get(key) or []
+    normalized = timestamp.replace(" ", "T")[:16]
+    record = hourly.get(normalized)
 
-    if position is None or position >= len(values):
+    if not record:
         return None
 
-    return _number(values[position])
+    return _number(record.get(key))
 
 
 def _add_weather(
     result: dict,
     weather: dict[str, Any] | None,
 ) -> None:
-    """Enrich an AQI result with weather data when available."""
+    """Add weather data to the AQI response."""
 
     if not weather:
         return
@@ -253,42 +305,29 @@ def _add_weather(
         current.get("wind_speed_10m")
     )
 
-    weather_times = hourly.get("time") or []
-
-    weather_index = {
-        timestamp: index
-        for index, timestamp in enumerate(weather_times)
-    }
-
+    # WeatherAPI free forecast does not provide past hourly data
+    # beyond its available forecast response.
     for record in result["recent_history"]:
-        timestamp = record["timestamp"]
-
-        record["temperature"] = _weather_value(
-            hourly, weather_index, "temperature_2m", timestamp
-        )
-        record["humidity"] = _weather_value(
-            hourly, weather_index, "relative_humidity_2m", timestamp
-        )
-        record["wind_speed"] = _weather_value(
-            hourly, weather_index, "wind_speed_10m", timestamp
-        )
+        record["temperature"] = None
+        record["humidity"] = None
+        record["wind_speed"] = None
 
     for record in result["forecast"]:
         timestamp = record["timestamp"]
 
         record["temperature"] = _weather_value(
-            hourly, weather_index, "temperature_2m", timestamp
+            hourly, "temperature_2m", timestamp
         )
         record["humidity"] = _weather_value(
-            hourly, weather_index, "relative_humidity_2m", timestamp
+            hourly, "relative_humidity_2m", timestamp
         )
         record["wind_speed"] = _weather_value(
-            hourly, weather_index, "wind_speed_10m", timestamp
+            hourly, "wind_speed_10m", timestamp
         )
 
 
 def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
-    """Fetch AQI data and enrich it with shared weather data."""
+    """Fetch AQI data and enrich it with WeatherAPI weather."""
 
     if city_id not in CITIES:
         raise ValueError(f"Unknown city: {city_id}")
@@ -302,10 +341,12 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
     fresh_cache, stale_cache = _get_cached(cache_key)
 
     if fresh_cache is not None:
-        # Retry weather enrichment independently when missing.
         if fresh_cache["current"].get("temperature") is None:
             weather_batch = _get_weather_batch()
-            _add_weather(fresh_cache, weather_batch.get(city_id))
+            _add_weather(
+                fresh_cache,
+                weather_batch.get(city_id),
+            )
             _save_cache(cache_key, fresh_cache)
 
         return fresh_cache
@@ -328,7 +369,9 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         "timezone": "auto",
     }
 
-    ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_context = truststore.SSLContext(
+        ssl.PROTOCOL_TLS_CLIENT
+    )
 
     try:
         with httpx.Client(
@@ -384,7 +427,9 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
 
         return _number(values[position])
 
-    current_time = datetime.fromisoformat(air_current["time"])
+    current_time = datetime.fromisoformat(
+        air_current["time"]
+    )
 
     history = []
     future = []
@@ -473,7 +518,6 @@ def fetch_city_data(city_id: str, horizon: int = 72) -> dict:
         "updated_at": air_current.get("time"),
     }
 
-    # Reuse the same shared weather batch for every horizon.
     weather_batch = _get_weather_batch()
     _add_weather(result, weather_batch.get(city_id))
 
